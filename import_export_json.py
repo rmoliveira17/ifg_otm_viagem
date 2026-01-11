@@ -2,11 +2,36 @@ import json
 import re
 from datetime import datetime
 
-def parse_db_to_model_inputs(json_path: str):
+
+def parse_db_to_model_inputs(json_path: str, user_start_date: str = None, validate_dates: bool = True):
     db = json.load(open(json_path, "r", encoding="utf-8"))
 
     # Tempo 0 do roteiro (em horas)
-    t0 = datetime.fromisoformat(db["metadata"]["inicio"])
+    # Usa data informada pelo usuário ou fallback para metadata
+    if user_start_date:
+        # Se o usuário passar apenas YYYY-MM-DD, adiciona hora padrão
+        t0_str = user_start_date if ' ' in user_start_date else f"{user_start_date} 00:00:00"
+        
+        # Validar se existem voos disponíveis para esta data
+        if validate_dates:
+            data_solicitada = user_start_date.split()[0] if ' ' in user_start_date else user_start_date
+            datas_disponiveis = sorted(set(a['data_voo'] for a in db['arestas']))
+            
+            if not datas_disponiveis:
+                raise ValueError("Nenhum voo disponível no banco de dados")
+            
+            data_min = datas_disponiveis[0]
+            data_max = datas_disponiveis[-1]
+            
+            if data_solicitada < data_min or data_solicitada > data_max:
+                raise ValueError(
+                    f"Data solicitada ({data_solicitada}) fora do intervalo disponível. "
+                    f"Voos disponíveis de {data_min} até {data_max}"
+                )
+    else:
+        t0_str = db["metadata"]["inicio"]
+    
+    t0 = datetime.fromisoformat(t0_str)
 
     # Nós / cidades
     V = list(db["nos"].keys())
@@ -39,6 +64,63 @@ def parse_db_to_model_inputs(json_path: str):
         C[(i, j, f)]   = float(a["custo_passagem"])
 
     return V, F, DEP, DUR, C, C_hotel, C_food, C_transfer
+
+
+def get_available_date_range(json_path: str):
+    """
+    Retorna o intervalo de datas disponíveis no banco de dados
+    
+    Returns:
+        dict com 'data_minima' e 'data_maxima'
+    """
+    db = json.load(open(json_path, "r", encoding="utf-8"))
+    datas_disponiveis = sorted(set(a['data_voo'] for a in db['arestas']))
+    
+    if not datas_disponiveis:
+        return {"data_minima": None, "data_maxima": None}
+    
+    return {
+        "data_minima": datas_disponiveis[0],
+        "data_maxima": datas_disponiveis[-1]
+    }
+
+
+def encontrar_voo(database, origem, destino, voo_id):
+    """
+    Função auxiliar para localizar um voo no database.json
+    
+    Busca por:
+    - origem e destino
+    - voo_id no formato VOOCOD_DATA_HORA ou match parcial
+    
+    Retorna o dict da aresta ou None se não encontrado
+    """
+    # Tentar extrair componentes do voo_id
+    partes = voo_id.split('_')
+    
+    # Buscar nas arestas
+    for aresta in database.get("arestas", []):
+        # Match exato de origem e destino
+        if aresta["origem"] != origem or aresta["destino"] != destino:
+            continue
+        
+        # Tentar match completo: voo_cod_data_hora
+        if len(partes) >= 3:
+            voo_cod_esperado = partes[0]
+            data_esperada = partes[1]
+            hora_esperada = partes[2]
+            
+            if (aresta.get("voo_cod") == voo_cod_esperado and
+                aresta.get("data_voo") == data_esperada and
+                aresta.get("hora_saida") == hora_esperada):
+                return aresta
+        
+        # Fallback: match só pelo voo_cod se tiver apenas um voo nessa rota
+        if len(partes) >= 1:
+            if aresta.get("voo_cod") == partes[0]:
+                return aresta
+    
+    return None
 
 
 def build_front_json_from_solution(model, db, origin, dest, dias_vars_prefix="dias_"):
@@ -94,9 +176,15 @@ def build_front_json_from_solution(model, db, origin, dest, dias_vars_prefix="di
         if cur not in next_city:
             break  # rota incompleta (debug)
         i, j, fid = trecho_by_city[cur]
+        
+        # Buscar voo usando função auxiliar mais robusta
         a = flight_by_fid.get((i, j, fid), None)
+        
+        # Se não encontrou, tentar com a função auxiliar
+        if not a:
+            a = encontrar_voo(db, i, j, fid)
 
-        # info do voo pro front
+        # info do voo pro front (preencher com dados reais do database)
         voo_info = {
             "id": fid,
             "cia": a.get("cia", a.get("companhia", "")) if a else "",
@@ -128,11 +216,17 @@ def build_front_json_from_solution(model, db, origin, dest, dias_vars_prefix="di
     # ---------------------------
     # 5) Custos abertos
     # ---------------------------
-    # Voos: soma dos preços dos escolhidos
+    # Voos: soma dos preços dos escolhidos (usando dados reais do database)
     custo_voos = 0.0
     for i, j, fid in chosen:
-        a = flight_by_fid.get((i, j, fid), {})
-        custo_voos += float(a.get("custo_passagem", 0.0))
+        a = flight_by_fid.get((i, j, fid), None)
+        
+        # Se não encontrou, tentar com a função auxiliar
+        if not a:
+            a = encontrar_voo(db, i, j, fid)
+        
+        if a:
+            custo_voos += float(a.get("custo_passagem", 0.0))
 
     # Hospedagem / Alimentação / Transporte: por cidade * diárias
     detalhes_hosp = []
@@ -153,9 +247,7 @@ def build_front_json_from_solution(model, db, origin, dest, dias_vars_prefix="di
 
         diaria_hotel = float(nos[city].get("custo_diaria_hotel", 0.0))
         diaria_food  = float(nos[city].get("custo_refeicao_diaria", 0.0))
-        diaria_trans = float(nos[city].get("transporte", {}).get("diaria", 0.0))
-        # se você usa "transfer_ida_volta" em vez de "diaria", troque aqui:
-        # diaria_trans = float(nos[city].get("transporte", {}).get("transfer_ida_volta", 0.0))
+        diaria_trans = float(nos[city].get("transporte", {}).get("transfer_ida_volta", 0.0))
 
         th = diaria_hotel * diarias
         tf = diaria_food  * diarias
